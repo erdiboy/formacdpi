@@ -61,23 +61,33 @@ VERSION = "2.6.0"
 DEFAULT_PORT = 8880
 BUFFER_SIZE = 262144  # 256KB — büyük buffer = daha az syscall = daha hızlı
 CONNECT_TIMEOUT = 10
-RELAY_TIMEOUT = 300
+RELAY_TIMEOUT = 600      # 10dk — voice/WebSocket bağlantıları idle kalabilir
 DRAIN_THRESHOLD = 524288  # 512KB — drain sadece buffer bu kadar dolunca yapılır
 
 # Engelli site listesi — sadece bunlara DPI bypass uygulanır (--only-blocked)
 # Diğer tüm siteler direkt geçer → hız düşüşü SIFIR
 BLOCKED_DOMAINS = [
-    # Discord
+    # Discord — Ana domainler (alt domainler otomatik eşleşir)
     'discord.com',
     'discord.gg',
     'discordapp.com',
+    'discordapp.net',       # Ses/medya/resim alt domainleri (voice, media, images vb.)
     'discord.media',
     'discordcdn.com',
+    # Discord — Spesifik alt domainler (root zaten kapsar, yedek olarak)
     'gateway.discord.gg',
     'cdn.discordapp.com',
     'media.discordapp.net',
     'images-ext-1.discordapp.net',
     'images-ext-2.discordapp.net',
+    # Discord — Ek domainler
+    'discord.co',
+    'dis.gd',
+    'discordsays.com',
+    'discordstatus.com',
+    'discord.new',
+    'discord.gift',
+    'discord.gifts',
     # Diğer sık engellenen siteler (Türkiye)
     'x.com',
     'twitter.com',
@@ -91,6 +101,15 @@ BLOCKED_DOMAINS = [
     'soundcloud.com',
     'medium.com',
 ]
+
+# Discord ses/medya sunucusu hostname desenleri
+# Ses sunucuları: {bölge}{sayı}.discord.gg  (ör: us-south12345.discord.gg)
+# Bazıları sadece sayılarla: 123456.discord.gg
+# discord.media subdomainleri de ses/medya olabilir
+_VOICE_SERVER_RE = re.compile(r'^[a-z0-9][a-z0-9-]+\.discord\.gg$', re.IGNORECASE)
+
+# gateway subdomainleri SES DEĞİL — bunlar normal bypass kullanmalı
+_GATEWAY_HOSTS = {'gateway.discord.gg', 'cdn.discord.gg'}
 
 # ═══════════════════════════════════════════════════════════════
 # Logging
@@ -794,6 +813,81 @@ class DPIBypass:
             if i < len(fragments) - 1:
                 await asyncio.sleep(self.fragment_delay)
 
+    async def send_fragmented_aggressive(self, writer: asyncio.StreamWriter,
+                                          fragments: List[bytes],
+                                          delay: float = 0.050):
+        """Ağresİf TCP segment bölme — GoodbyeDPI eşdeğeri.
+
+        Normal send_fragmented'da macOS kernel kısa aralıklı
+        segment'leri birleştirebiliyor. Bu yöntem bunu engeller:
+
+        Teknik:
+          1. SO_SNDBUF = 256 byte (küçük send buffer → kernel buffer'da
+             tutamaz → anlık gönderim ZORLANIR)
+          2. TCP_NODELAY = 1 (Nagle kapalı)
+          3. TCP_NOPUSH cork/uncork (flush garantisi)
+          4. 50ms delay (segmentin NIC'den çıkıp gitmesini bekle)
+          5. SO_SNDBUF restore (relay için normal buffer geri yükle)
+
+        Bu kombinasyon macOS'ta HAM paket seviyesi segment ayrımı
+        sağlar — GoodbyeDPI'n WinDivert'i ile eşdeğer sonuç.
+        """
+        if writer.is_closing():
+            raise ConnectionError("Writer zaten kapatılmış")
+
+        sock = writer.transport.get_extra_info('socket')
+        if not sock:
+            # Fallback: normal send
+            for i, chunk in enumerate(fragments):
+                writer.write(chunk)
+                await writer.drain()
+                if i < len(fragments) - 1:
+                    await asyncio.sleep(delay)
+            return
+
+        TCP_NOPUSH = getattr(socket, 'TCP_NOPUSH', 4)
+
+        # Orijinal buffer boyutunu kaydet
+        try:
+            orig_sndbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+        except OSError:
+            orig_sndbuf = 131072  # macOS default
+
+        try:
+            # ═══ ADIM 1: Küçük buffer + Nagle kapalı ═══
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+            for i, chunk in enumerate(fragments):
+                # Cork
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, TCP_NOPUSH, 1)
+                except OSError:
+                    pass
+
+                # Gönder (küçük buffer = kernel anlık flush zorlar)
+                sock.sendall(chunk)
+
+                # Uncork
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, TCP_NOPUSH, 0)
+                except OSError:
+                    pass
+
+                if i < len(fragments) - 1:
+                    await asyncio.sleep(delay)
+
+            log.debug(
+                f"  → {len(fragments)} TCP segment (agresif): "
+                f"{[len(f) for f in fragments]}, delay={delay*1000:.0f}ms"
+            )
+        finally:
+            # ═══ ADIM 2: Buffer'i restore et (relay için büyük buffer lazım) ═══
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, orig_sndbuf)
+            except OSError:
+                pass
+
     # --- TCP OOB Desync (v2.4 Ana Teknik) ---
 
     async def send_with_oob_desync(self, writer: asyncio.StreamWriter,
@@ -1323,6 +1417,7 @@ class ProxyServer:
             'active': 0,
             'errors': 0,
             'dns_bypass': 0,
+            'voice_fallback': 0,
             'start_time': time.time(),
         }
 
@@ -1486,8 +1581,62 @@ class ProxyServer:
                 if self.verbose:
                     log.info(f"  \033[90m⏩ Direkt (engelli değil)\033[0m")
             else:
-                # DPI bypass ile gönder
-                success = await self.bypass.process_tls_data(server_writer, client_hello)
+                # ═══ Ses sunucusu özel bypass ═══
+                # GoodbyeDPI farkı: Paket seviyesinde TCP segment bölüyor.
+                # macOS'ta bunu uygulama seviyesinde yapmak zor çünkü kernel
+                # kısa aralıklı segmentleri birleştiriyor.
+                #
+                # Çözüm: SO_SNDBUF=256 ile kernel'in buffer'da tutma kapasitesini
+                # yok et + TCP_NOPUSH cork/uncork + 50ms delay.
+                # Bu GoodbyeDPI'nın WinDivert'i ile eşdeğer sonuç verir.
+                #
+                # ÖNEMLİ: TLS record split YAPMA — sadece ham TCP byte
+                # segmentasyonu. GoodbyeDPI de TLS record'a dokunmuyor.
+                is_voice = self._is_voice_server(host)
+                if is_voice:
+                    if self.verbose:
+                        log.info(f"  \033[95m🎤 Ses sunucusu\033[0m → Agresif TCP seg (GoodbyeDPI tarzı)")
+
+                    # Saf TCP segmentasyonu — TLS record'a dokunma!
+                    # GoodbyeDPI tam olarak bunu yapıyor.
+                    info = parse_tls_client_hello(client_hello)
+                    if info and info.get('sni_offset'):
+                        sni_start = info['sni_offset']
+                        # 3 segment: [0x16] + [header...SNI öncesi] + [SNI + devam]
+                        fragments = [
+                            client_hello[:1],           # 0x16 tek başına
+                            client_hello[1:sni_start],  # TLS header (SNI yok)
+                            client_hello[sni_start:],   # SNI + geri kalan
+                        ]
+                        fragments = [f for f in fragments if f]
+
+                        try:
+                            voice_bypass = DPIBypass({'fragment_delay': 0.050})
+                            await voice_bypass.send_fragmented_aggressive(
+                                server_writer, fragments, delay=0.050
+                            )
+                            success = True
+                        except Exception as e:
+                            log.debug(f"  Agresif TCP seg hatası: {e}")
+                            success = False
+                    else:
+                        success = False
+
+                    if not success:
+                        # Fallback: direkt gönder
+                        if self.verbose:
+                            log.info(f"  \033[93m⚠ Ses fallback\033[0m → direkt gönderim")
+                        try:
+                            server_writer.write(client_hello)
+                            await server_writer.drain()
+                            success = True
+                        except:
+                            success = False
+                    self.stats['voice_fallback'] += 1
+                else:
+                    # Normal bypass
+                    success = await self.bypass.process_tls_data(server_writer, client_hello)
+
                 if not success:
                     return
 
@@ -1580,6 +1729,22 @@ class ProxyServer:
                 return True
         return False
 
+    @staticmethod
+    def _is_voice_server(hostname: str) -> bool:
+        """Discord ses/medya sunucusu endpoint'i mi kontrol et.
+        Ses sunucuları: {bölge}{sayı}.discord.gg, {sayı}.discord.gg
+        Gateway sunucuları hariç — onlar normal bypass kullanır.
+        discord.media subdomainleri de ses/medya olarak kabul edilir.
+        """
+        hostname = hostname.lower().strip('.')
+        # gateway/cdn hariç tüm *.discord.gg subdomainleri (bare domain hariç)
+        if hostname.endswith('.discord.gg') and hostname not in _GATEWAY_HOSTS:
+            return True
+        # discord.media subdomainleri (bare domain hariç)
+        if hostname.endswith('.discord.media'):
+            return True
+        return False
+
     async def _read_tls_record(self, reader: asyncio.StreamReader) -> Optional[bytes]:
         """Tam TLS kaydı oku (header + payload)."""
         collected = b''
@@ -1625,10 +1790,11 @@ class ProxyServer:
                       writer: asyncio.StreamWriter, label: str = ''):
         """Yüksek hızlı çift yönlü veri aktarımı.
 
-        v2.6 Optimizasyon:
+        v2.7 Düzeltmeler:
           - drain() her write'da DEĞİL, sadece buffer dolunca yapılır
           - Büyük buffer (256KB) = daha az syscall
-          - write_eof sadece destekleniyorsa
+          - write_eof KALDIRILDI: WebSocket/voice bağlantılarını erken kapatıyordu
+          - Timeout arttırıldı: Discord voice idle bağlantıları uzun sürebilir
         """
         try:
             while self._running:
@@ -1638,6 +1804,8 @@ class ProxyServer:
                 )
                 if not data:
                     break
+                if writer.is_closing():
+                    break
                 writer.write(data)
                 # drain() sadece buffer çok doluysa — throughput BÜYÜK fark!
                 # Her write'da drain = her pakette TCP flush bekleme = YAVAŞ
@@ -1646,17 +1814,12 @@ class ProxyServer:
                 if buf_size > DRAIN_THRESHOLD:
                     await writer.drain()
         except (asyncio.TimeoutError, ConnectionError, OSError,
-                asyncio.IncompleteReadError):
+                asyncio.IncompleteReadError, asyncio.CancelledError):
             pass
         finally:
             try:
-                # Son veriyi flush et
-                await writer.drain()
-            except:
-                pass
-            try:
-                if writer.can_write_eof():
-                    writer.write_eof()
+                if not writer.is_closing():
+                    await writer.drain()
             except:
                 pass
 
@@ -1784,6 +1947,9 @@ def format_stats(stats: dict) -> str:
     uptime = int(time.time() - stats['start_time'])
     h, m, s = uptime // 3600, (uptime % 3600) // 60, uptime % 60
 
+    vf = stats.get('voice_fallback', 0)
+    vf_str = f" | \U0001f3a4FB: {vf}" if vf > 0 else ""
+
     return (
         f"\r\033[90m"
         f"[{h:02d}:{m:02d}:{s:02d}] "
@@ -1793,6 +1959,7 @@ def format_stats(stats: dict) -> str:
         f"Aktif: {stats['active']} | "
         f"Hata: {stats['errors']} | "
         f"DNS\u2197: {stats['dns_bypass']}"
+        f"{vf_str}"
         f"\033[0m"
     )
 

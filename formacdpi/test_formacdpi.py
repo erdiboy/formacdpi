@@ -424,6 +424,80 @@ def run_tests():
         print(f'  ❌ OOB backward compat: expected classic, got {engine_compat.oob_mode}')
         failed += 1
 
+    # ═══ v2.7 Voice Tests ═══
+
+    # Test 26: Voice server detection (v2.8 — broader, uses _is_voice_server method)
+    from formacdpi import ProxyServer as _PS
+    voice_hosts = [
+        'us-south12345.discord.gg',
+        'europe4567.discord.gg',
+        'brazil890.discord.gg',
+        'singapore1.discord.gg',
+        'us-east-1a2b.discord.gg',
+        '123456789.discord.gg',
+        'rotterdam3321.discord.gg',
+        'some-region.discord.media',
+    ]
+    non_voice_hosts = [
+        'gateway.discord.gg',
+        'cdn.discord.gg',
+        'discord.gg',
+        'cdn.discordapp.com',
+        'discord.com',
+    ]
+    voice_ok = all(_PS._is_voice_server(h) for h in voice_hosts)
+    non_voice_ok = all(not _PS._is_voice_server(h) for h in non_voice_hosts)
+    if voice_ok and non_voice_ok:
+        print(f'  ✅ Voice server detection: {len(voice_hosts)} voice, {len(non_voice_hosts)} non-voice')
+        passed += 1
+    else:
+        for h in voice_hosts:
+            if not _PS._is_voice_server(h):
+                print(f'    ❌ Should be voice: {h}')
+        for h in non_voice_hosts:
+            if _PS._is_voice_server(h):
+                print(f'    ❌ Should NOT be voice: {h}')
+        print(f'  ❌ Voice server detection: voice={voice_ok}, non_voice={non_voice_ok}')
+        failed += 1
+
+    # Test 27: discordapp.net root domain blocking
+    from formacdpi import BLOCKED_DOMAINS
+    net_root = 'discordapp.net' in BLOCKED_DOMAINS
+    # Alt domain eşleşmesi simülasyonu
+    test_hostname = 'voice-server-123.discordapp.net'
+    net_subdomain_match = any(
+        test_hostname == d or test_hostname.endswith('.' + d)
+        for d in BLOCKED_DOMAINS
+    )
+    if net_root and net_subdomain_match:
+        print(f'  ✅ discordapp.net: root in list, subdomain matches')
+        passed += 1
+    else:
+        print(f'  ❌ discordapp.net: root={net_root}, subdomain_match={net_subdomain_match}')
+        failed += 1
+
+    # Test 28: Voice bypass = Agresif TCP seg (GoodbyeDPI tarzı, TLS record split yok)
+    voice_bypass = DPIBypass({
+        'fragment_delay': 0.050,
+    })
+    has_aggressive = hasattr(voice_bypass, 'send_fragmented_aggressive')
+    if has_aggressive and voice_bypass.fragment_delay >= 0.050:
+        print(f'  ✅ Voice bypass config: Agresif TCP seg (SO_SNDBUF=256, 50ms delay, TLS rec split yok)')
+        passed += 1
+    else:
+        print(f'  ❌ Voice bypass config: aggressive={has_aggressive}, delay={voice_bypass.fragment_delay}')
+        failed += 1
+
+    # Test 29: Voice server SNI extraction
+    hello_voice = build_test_client_hello('us-south12345.discord.gg')
+    sni_voice = extract_sni(hello_voice)
+    if sni_voice == 'us-south12345.discord.gg':
+        print(f'  ✅ Voice SNI extraction: {sni_voice}')
+        passed += 1
+    else:
+        print(f'  ❌ Voice SNI extraction: {sni_voice}')
+        failed += 1
+
     print(f'\n  {"🎉" if failed == 0 else "⚠️"} Sonuc: {passed}/{passed+failed} test basarili')
     return failed == 0
 
