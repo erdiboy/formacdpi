@@ -288,3 +288,293 @@ formacdpi/
 ## Lisans
 
 MIT License — Detaylar için [LICENSE](LICENSE) dosyasına bakın.
+
+---
+
+<details>
+<summary><strong>🇬🇧 English</strong></summary>
+
+# ForMacDPI
+
+<p align="center">
+  <strong>DPI (Deep Packet Inspection) Bypass Tool for macOS</strong><br>
+  <em>macOS adaptation of GoodbyeDPI (Windows)</em>
+</p>
+
+---
+
+## What Does It Do?
+
+Bypasses **DPI (Deep Packet Inspection)** systems used by ISPs to block websites. Works without a VPN and with zero speed loss.
+
+**Provides access to blocked sites in Turkey: Discord, X (Twitter), Pastebin, Imgur, etc.**
+
+> ⚠️ This tool is for educational and research purposes only. Use at your own responsibility.
+
+## Features
+
+- 🚀 **Zero dependencies** — Python standard library only
+- 🔒 **Not a VPN** — Does not encrypt or reroute traffic, only fragments packets
+- ⚡ **No speed loss** — Smart mode: bypass applied only to blocked sites
+- 🌐 **DNS-over-HTTPS** — Bypasses DNS blocking too (Cloudflare + Google)
+- 🍎 **macOS native** — Uses `TCP_NOPUSH` for guaranteed TCP segment separation
+- 🔧 **Auto proxy** — Automatically configures and restores system proxy settings
+- 🧪 **Auto test** — Tests Discord connectivity on startup
+
+## How It Works
+
+DPI systems analyze network packets to block access to specific sites. ForMacDPI **fragments** or **corrupts** these packets so the DPI cannot identify the target site. The server reassembles the fragments into the original request — the connection works 100% normally.
+
+```
+┌─────────┐         ┌─────┐         ┌──────────┐
+│ Browser  │ ──────▶ │ DPI │ ──────▶ │  Server  │
+└─────────┘         └─────┘         └──────────┘
+
+  Normal:     [discord.com]  →  DPI sees "discord.com"  →  ❌ BLOCKED
+
+  ForMacDPI:  [disc] + [OOB] + [ord.com]  →  DPI can't parse  →  ✅ PASSED
+              Server removes OOB → "discord.com" = clean connection
+```
+
+## Techniques
+
+| Technique | Description |
+|-----------|-------------|
+| **TCP OOB Desync** | Corrupts DPI stream parsing using TCP Urgent (Out-of-Band) data. 3 modes: `classic`, `prefix`, `mid` |
+| **Multi-Record TLS Split** | Splits ClientHello into N valid TLS records — DPI can't reassemble |
+| **TCP_NOPUSH Segment Split** | macOS-specific TCP_NOPUSH flag ensures packets are sent as separate segments |
+| **TCP Segmentation** | Splits at SNI boundary into separate TCP segments (GoodbyeDPI technique) |
+| **HTTP Host Fragmentation** | Splits the HTTP Host header into fragments |
+| **Host Case Mixing** | `example.com` → `eXaMpLe.CoM` (breaks DPI pattern matching) |
+| **Fake Packet (TTL trick)** | Sends a fake packet with low TTL — DPI sees it but it never reaches the server |
+| **DNS-over-HTTPS** | Encrypted DNS resolution via Cloudflare (1.1.1.1) and Google (8.8.8.8) |
+
+## Installation
+
+### Requirements
+
+- **macOS 10.15+** (Catalina or later)
+- **Python 3.8+**
+- No additional packages required
+
+### Steps
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/erdiboy/formacdpi.git
+cd formacdpi
+
+# 2. Check Python (usually pre-installed on macOS)
+python3 --version
+
+# If not installed:
+brew install python3
+# or
+xcode-select --install
+
+# 3. Make scripts executable
+chmod +x start.sh stop.sh
+```
+
+## Usage
+
+### Quick Start (Recommended)
+
+```bash
+# 🇹🇷 Best mode for Turkey — OOB Prefix (RECOMMENDED)
+sudo python3 formacdpi.py -8 -v
+
+# or using the shell script (default: -6 Turkey mode)
+sudo ./start.sh
+```
+
+> `sudo` is required to automatically configure system proxy settings. Use `--no-auto-proxy` to run without sudo.
+
+### Strategies
+
+| Flag | Strategy | Description |
+|------|----------|-------------|
+| `-1` | Basic SNI Split | Default, simple TCP segmentation |
+| `-2` | SNI + Host Case Mix | Adds host case mixing |
+| `-3` | SNI Multi-Split | Splits into 3 segments |
+| `-4` | SNI + Fake Packet | TTL trick with fake packet |
+| `-5` | Full Aggressive | All techniques combined |
+| `-6` | 🇹🇷 Turkey v1 | Classic OOB Desync |
+| `-7` | 🇹🇷 Turkey v1 Alt | OOB + Record Split |
+| `-8` | 🇹🇷 **Turkey v2 (RECOMMENDED)** | OOB Prefix — most effective |
+| `-9` | 🇹🇷 Turkey v3 | OOB SNI Middle + Multi-Record |
+
+```bash
+# Recommended (Turkey)
+sudo python3 formacdpi.py -8 -v
+
+# If it doesn't work, try alternatives:
+sudo python3 formacdpi.py -9 -v    # OOB SNI middle
+sudo python3 formacdpi.py -6 -v    # Classic OOB
+sudo python3 formacdpi.py -5 -v    # Aggressive mode
+```
+
+### Advanced Options
+
+```bash
+# Custom port
+sudo python3 formacdpi.py -8 --port 9090
+
+# Verbose logging
+sudo python3 formacdpi.py -8 -v
+
+# Debug mode (very detailed)
+sudo python3 formacdpi.py -8 --debug
+
+# Run without auto proxy (configure manually)
+python3 formacdpi.py -8 --no-auto-proxy
+
+# Apply bypass to all traffic (default: blocked sites only)
+sudo python3 formacdpi.py -8 --all-traffic
+
+# Disable secure DNS
+sudo python3 formacdpi.py -8 --no-dns
+
+# Custom fragment size and delay
+sudo python3 formacdpi.py -8 --fragment-size 3 --fragment-delay 0.15
+
+# Manually enable OOB (for any strategy)
+sudo python3 formacdpi.py -5 --oob
+
+# Skip startup test
+sudo python3 formacdpi.py -8 --no-test
+```
+
+### Stopping
+
+```bash
+# Stop with Ctrl+C (proxy settings are automatically restored)
+
+# or in a separate terminal:
+sudo ./stop.sh
+```
+
+### Running Without Sudo
+
+```bash
+# Proxy is configured manually, no sudo needed
+python3 formacdpi.py -8 --no-auto-proxy
+
+# Then set the proxy in your browser or system settings:
+# HTTP Proxy:  127.0.0.1:8880
+# HTTPS Proxy: 127.0.0.1:8880
+```
+
+## Blocked Sites List
+
+ForMacDPI runs in **smart mode** by default: DPI bypass is applied only to known blocked sites, all other traffic passes through directly — zero speed loss.
+
+Supported blocked sites:
+- **Discord** — discord.com, discordapp.com, cdn, gateway, etc.
+- **X / Twitter** — x.com, twitter.com, twimg.com, t.co
+- **Others** — Pastebin, Imgur, Archive.org, SoundCloud, Medium
+
+> Use `--all-traffic` to apply bypass to all traffic.
+
+## OOB Desync Modes (v2.5+)
+
+ForMacDPI's most powerful technique is **TCP OOB (Out-of-Band) Desync**. It offers 3 modes:
+
+### 🟢 Prefix Mode (`-8`, Recommended)
+```
+OOB byte → ClientHello
+DPI sees:  \x00 + 0x16... → "Not valid TLS" → skips
+Server:    removes OOB → 0x16... = clean ClientHello ✅
+```
+
+### 🔵 Classic Mode (`-6`)
+```
+[before SNI] → OOB byte → [SNI + rest]
+DPI sees:  ...disc\x00ord.com... → SNI doesn't match
+Server:    removes OOB → discord.com = clean ✅
+```
+
+### 🟣 Mid Mode (`-9`)
+```
+[up to mid-SNI] → OOB byte → [rest of SNI]
+DPI sees:  "disco\x00rd.com" → no match
+Server:    removes OOB → "discord.com" = clean ✅
+```
+
+## Tests
+
+```bash
+# Run unit tests
+python3 test_formacdpi.py
+```
+
+Tests cover:
+- SNI extraction and offset calculation
+- HTTP Host parsing and manipulation
+- CONNECT / HTTP proxy request parsing
+- Host case mixing (`example.com` → `eXaMpLe.CoM`)
+- TCP segmentation and TLS record splitting
+- OOB desync data integrity
+- Fake ClientHello generation
+
+## Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| `Permission denied` | Run with `sudo` |
+| Discord still not loading | Try a different strategy: `-9` or `-6` |
+| Slow connection | Check if `--only-blocked` (default) is active |
+| DNS not resolving | Try `--no-dns`, ISP DNS may be working |
+| Proxy not setting | Use `--no-auto-proxy` and configure browser manually |
+| Port in use | Use a different port: `--port 9090` |
+| `python3 not found` | `brew install python3` or `xcode-select --install` |
+
+## Architecture
+
+```
+formacdpi/
+├── formacdpi.py        # Main application (proxy + DPI bypass engine)
+├── test_formacdpi.py   # Unit tests
+├── start.sh            # Quick start script
+├── stop.sh             # Stop script
+└── README.md
+```
+
+### Components
+
+| Component | Description |
+|-----------|-------------|
+| **SecureDNS** | DoH (DNS-over-HTTPS) + UDP DNS + system DNS fallback chain |
+| **DPIBypass** | Engine containing all bypass techniques (OOB, TLS split, TCP segment, etc.) |
+| **ProxyServer** | asyncio-based HTTP/HTTPS proxy server |
+| **MacOSProxy** | Automatically manages macOS system proxy settings |
+
+## Technical Details
+
+- Runs asynchronously with Python `asyncio` — supports hundreds of concurrent connections
+- Uses macOS `TCP_NOPUSH` flag for kernel-level TCP segment separation
+- Combines `TCP_NODELAY` (Nagle off) + `TCP_NOPUSH` (cork/uncork)
+- DNS cache (1 hour TTL) to avoid unnecessary DNS queries
+- 256KB buffer for minimum syscall overhead
+- Graceful shutdown: clean exit and proxy restoration on `SIGINT`/`SIGTERM`
+- **Platform**: macOS 10.15+ (Catalina, Big Sur, Monterey, Ventura, Sonoma, Sequoia)
+
+## Contributing
+
+1. Fork the repo
+2. Create a feature branch (`git checkout -b feature/new-feature`)
+3. Commit your changes (`git commit -m 'Add new feature'`)
+4. Push your branch (`git push origin feature/new-feature`)
+5. Open a Pull Request
+
+## Credits
+
+- [GoodbyeDPI](https://github.com/ValdikSS/GoodbyeDPI) — Windows DPI bypass (inspiration)
+- [byedpi](https://github.com/hufrea/byedpi) — OOB Desync technique
+- [zapret](https://github.com/bol-van/zapret) — DPI bypass research
+
+## License
+
+MIT License — See [LICENSE](LICENSE) for details.
+
+</details>
